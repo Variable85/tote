@@ -12,13 +12,14 @@
   "scripts": {
     "postinstall": "node scripts/copy-vendor.js",
     "start": "electron .",
-    "test": "node scripts/test-layout.js && node scripts/test-scratch.js && node scripts/test-doc.js && node scripts/test-npmfix.js",
+    "test": "node scripts/test-layout.js && node scripts/test-scratch.js && node scripts/test-doc.js && node scripts/test-npmfix.js && node scripts/test-remote.js",
     "pack": "electron-builder --dir",
     "dist": "electron-builder",
     "dist:linux": "electron-builder --linux",
     "dist:pacman": "electron-builder --linux pacman",
     "dist:mac": "electron-builder --mac",
-    "dist:win": "electron-builder --win"
+    "dist:win": "electron-builder --win",
+    "install:mac": "scripts/install-macos.sh"
   },
   "build": {
     "appId": "com.tote.app",

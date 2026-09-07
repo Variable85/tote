@@ -7,8 +7,33 @@ const os = require('os');
 const { execFile } = require('child_process');
 const { pathToFileURL } = require('url');
 const S = require('./scratch');
+const { RemoteConn, RemoteFs } = require('./remote');
 
-const IGNORE = new Set(['node_modules', '.git', '.DS_Store', 'dist', 'out', '.cache']);
+// Generated caches: hidden from the tree and, more importantly, never watched.
+// See WATCH_BUDGET -- a single one of these can hold more files than the whole
+// rest of a project. `.godot` is why a Godot workspace broke every agent
+// terminal: 5k import-cache files, none of them anything a user wants to see.
+const IGNORE = new Set([
+  'node_modules', '.git', '.DS_Store', 'dist', 'out', '.cache',
+  '.godot', '__pycache__', '.venv', '.pytest_cache', '.mypy_cache', '.ruff_cache',
+  '.next', '.nuxt', '.svelte-kit', '.turbo', '.parcel-cache', '.gradle',
+  '.terraform', 'Pods',
+]);
+
+// Ceiling on how many paths the tree watcher may bind.
+//
+// chokidar 4 dropped its fsevents dependency, so on every platform it falls
+// back to fs.watch and opens ONE DESCRIPTOR PER WATCHED PATH. A workspace with
+// a big generated cache (a Godot `.godot`, a Unity `Library/`, a Rust
+// `target/`) therefore drags the main process up to its RLIMIT_NOFILE, and the
+// first thing that fails afterwards is pty allocation: node-pty hands back a
+// child with no controlling tty, so Claude Code and every other TUI agent exits
+// immediately with code 1 and prints nothing. Terminals, not the file tree, are
+// what breaks -- which makes it a genuinely confusing failure to chase.
+//
+// IGNORE alone cannot be trusted to hold the line (the next project type brings
+// a cache dir nobody listed), so the depth is chosen to fit this budget.
+const WATCH_BUDGET = 4000;
 const PARTIAL_EXT = new Set(['.crdownload', '.part', '.download', '.partial', '.tmp']);
 const TEXT_EXT = new Set([
   '.txt', '.md', '.markdown', '.json', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx',
@@ -48,6 +73,14 @@ function docKind(name) {
 
 const mb = (n) => (n / (1024 * 1024)).toFixed(1) + ' MB';
 
+// Handed to RemoteFs rather than duplicated there. A remote tree node and a
+// remote doc pane therefore decide a file's kind with the same functions the
+// local ones use, which is what keeps them from ever disagreeing.
+const FILE_META = {
+  docKind, extOf, mb, MIME, MAX_READ_BYTES, MAX_IMAGE_BYTES,
+  isTextFile: (name) => TEXT_EXT.has(extOf(name)),
+};
+
 // Resolve symlinks as far down as the path actually exists, then re-append the
 // rest. A path that is not there yet -- a promotion target -- or not there any
 // more -- a scratch folder deleted by hand -- still has to be comparable with a
@@ -69,6 +102,14 @@ function expandTilde(p) {
   return p === '~' ? os.homedir() : p.startsWith('~' + path.sep) || p.startsWith('~/')
     ? path.join(os.homedir(), p.slice(2))
     : p;
+}
+
+// The path to show and to use for a space. A remote space's path belongs to the
+// remote filesystem: expanding a leading ~ here would silently point it at THIS
+// machine's home, which is the sort of bug that only shows up as files landing
+// in the wrong place. The remote ~ is resolved by the connect probe instead.
+function wsPath(w) {
+  return w && w.host ? w.path : expandTilde(w.path);
 }
 
 // macOS stamps every downloaded file with a com.apple.quarantine xattr whose
@@ -95,13 +136,106 @@ class WorkspaceManager {
     this.cfg = configStore;
     this.watcher = null;
     this.dlWatcher = null;
+    this.poller = null;
+    this.conns = new Map();          // spaceId -> RemoteConn, created lazily
+    this.remoteHooks = null;         // set by configureRemote() once main.js has a PtyManager
+    this.ensureInbox();
+  }
+
+  // main.js owns the userData paths and the PtyManager, so the pieces RemoteConn
+  // needs are injected once both exist rather than reached for from here.
+  configureRemote(hooks) {
+    this.remoteHooks = hooks;
+  }
+
+  /* ----- remote spaces -----
+   *
+   * A space is remote iff it carries a host. Everything below dispatches on
+   * that one field, and the local paths above must never be applied to one:
+   * a remote `~/proj` is not this machine's home, and a remote inbox is not a
+   * directory this machine may create.
+   */
+
+  isRemote(space) {
+    return !!(space && space.host);
+  }
+
+  // One connection per remote space, created on first use and kept afterwards:
+  // its control socket outlives Tote, so a restart usually reconnects silently.
+  conn(space) {
+    if (!this.isRemote(space)) return null;
+    let c = this.conns.get(space.id);
+    if (!c) {
+      if (!this.remoteHooks) throw new Error('Remote support is not wired up yet');
+      c = new RemoteConn({ id: space.id, host: space.host, root: space.path, ...this.remoteHooks });
+      this.conns.set(space.id, c);
+    }
+    c.host = space.host;             // the space may have been edited since
+    return c;
+  }
+
+  // A space's file backend, or null when it is a local folder. Resolved per
+  // call, never cached, for the same reason getRoot() is.
+  backendFor(space) {
+    if (!this.isRemote(space)) return null;
+    return new RemoteFs(this.conn(space), { ignore: [...IGNORE], meta: FILE_META });
+  }
+
+  backend() {
+    return this.backendFor(this.active());
+  }
+
+  // Land a local file in a named space's inbox. A download is routed to a space
+  // when it starts, so it must finish in that one even if the user has switched
+  // in the meantime -- which is the one place the active space is deliberately
+  // not what decides.
+  async ingestInto(spaceId, absSource, providerId) {
+    const space = this.cfg.getWorkspaces().list.find((w) => w.id === spaceId);
+    if (!space) throw new Error('Unknown workspace: ' + spaceId);
+    const R = this.backendFor(space);
+    if (R) return R.ingest(absSource, providerId);
+    const inbox = path.join(wsPath(space), 'inbox', providerId || '_desktop');
+    fs.mkdirSync(inbox, { recursive: true });
+    const target = path.join(inbox, path.basename(absSource));
+    fs.copyFileSync(absSource, target);
+    return target;
+  }
+
+  remoteState(id) {
+    const space = this.list().find((w) => w.id === id) || this.active();
+    if (!this.isRemote(space)) return null;
+    return this.conn(space).info();
+  }
+
+  // Registry entry for a remote space: the same shape as a local one plus a
+  // host. The path stays exactly as typed (it may be `~/proj`); the connect
+  // probe resolves it on the remote and the absolute result lives on the
+  // connection, not in the registry.
+  addRemote(name, host, remotePath) {
+    const h = String(host || '').trim();
+    const p = String(remotePath || '').trim();
+    if (!h) throw new Error('Remote space needs a host');
+    if (!p) throw new Error('Remote space needs a path on that host');
+    const data = this.cfg.getWorkspaces();
+    const base = S.slug(name) || 'remote';
+    const taken = new Set(data.list.map((w) => w.id));
+    const id = S.uniqueDirName(base + '-' + Date.now().toString(36), (n) => taken.has(n));
+    data.list.push({ id, name: String(name).trim() || h, path: p, host: h });
+    this.cfg.saveWorkspaces(data);
+    return id;
+  }
+
+  // Only ever the active space's inbox, and only when it is local. A remote
+  // space's inbox is created on the remote, by RemoteFs.ingest.
+  ensureInbox() {
+    if (this.isRemote(this.active())) return;
     fs.mkdirSync(this.inboxDir(), { recursive: true });
   }
 
   /* ----- spaces registry ----- */
 
   list() {
-    return this.cfg.getWorkspaces().list.map((w) => ({ ...w, path: expandTilde(w.path) }));
+    return this.cfg.getWorkspaces().list.map((w) => ({ ...w, path: wsPath(w) }));
   }
 
   activeId() {
@@ -111,7 +245,7 @@ class WorkspaceManager {
   active() {
     const data = this.cfg.getWorkspaces();
     const found = data.list.find((w) => w.id === data.active) || data.list[0];
-    return { ...found, path: expandTilde(found.path) };
+    return { ...found, path: wsPath(found) };
   }
 
   setActive(id) {
@@ -121,7 +255,7 @@ class WorkspaceManager {
     data.active = id;
     if (target.temp) target.lastUsed = Date.now();   // what the sweep reads
     this.cfg.saveWorkspaces(data);
-    fs.mkdirSync(this.inboxDir(), { recursive: true });
+    this.ensureInbox();
     return this.active();
   }
 
@@ -201,6 +335,9 @@ class WorkspaceManager {
     const raw = data.list.find((w) => w.id === id);
     if (!raw) throw new Error('Unknown workspace: ' + id);
     if (!raw.temp) throw new Error('Not a temp space: ' + (raw.name || id));
+    // Every guard below compares local realpaths, which mean nothing for a path
+    // on another machine -- so a remote space is refused before they can run.
+    if (this.isRemote(raw)) throw new Error('Refusing to delete a remote space');
     if (data.list.length <= 1) throw new Error('Keep at least one workspace');
 
     const root = this.scratchRoot();
@@ -233,6 +370,7 @@ class WorkspaceManager {
     const raw = data.list.find((w) => w.id === id);
     if (!raw) throw new Error('Unknown workspace: ' + id);
     if (!raw.temp) throw new Error('Not a temp space: ' + (raw.name || id));
+    if (this.isRemote(raw)) throw new Error('Remote spaces cannot be promoted');
 
     const from = path.resolve(expandTilde(raw.path));
     const to = path.resolve(absPath);
@@ -295,10 +433,10 @@ class WorkspaceManager {
     }
     if (absPath !== undefined) {
       w.path = absPath;
-      fs.mkdirSync(path.join(absPath, 'inbox'), { recursive: true });
+      if (!this.isRemote(w)) fs.mkdirSync(path.join(absPath, 'inbox'), { recursive: true });
     }
     this.cfg.saveWorkspaces(data);
-    return { ...w, path: expandTilde(w.path) };
+    return { ...w, path: wsPath(w) };
   }
 
   // New strip order. `ids` is the order the renderer just dragged into; any
@@ -342,7 +480,13 @@ class WorkspaceManager {
 
   /* ----- file ops (active workspace) ----- */
 
+  // Local-only, and deliberately still synchronous: the callers that need a real
+  // path on this machine (shell.trashItem, openPath, revealPath) cannot be given
+  // a remote one at all. localFileFor() is the remote-aware alternative.
   resolveSafe(rel) {
+    if (this.isRemote(this.active())) {
+      throw new Error('That is only available for local spaces');
+    }
     const abs = path.resolve(this.getRoot(), rel);
     const rootAbs = path.resolve(this.getRoot());
     if (abs !== rootAbs && !abs.startsWith(rootAbs + path.sep)) {
@@ -355,7 +499,9 @@ class WorkspaceManager {
     return TEXT_EXT.has(extOf(name));
   }
 
-  tree(depth = 5) {
+  async tree(depth = 5) {
+    const R = this.backend();
+    if (R) return R.tree(depth);
     const walk = (abs, rel, d) => {
       let entries;
       try {
@@ -388,7 +534,9 @@ class WorkspaceManager {
     return walk(this.getRoot(), '.', depth);
   }
 
-  readText(rel) {
+  async readText(rel) {
+    const R = this.backend();
+    if (R) return R.readText(rel);
     const abs = this.resolveSafe(rel);
     const stat = fs.statSync(abs);
     if (stat.size > MAX_READ_BYTES) throw new Error('File too large to edit inline (> 2 MB)');
@@ -397,7 +545,9 @@ class WorkspaceManager {
     return buf.toString('utf8');
   }
 
-  writeText(rel, content) {
+  async writeText(rel, content) {
+    const R = this.backend();
+    if (R) return R.writeText(rel, content);
     const abs = this.resolveSafe(rel);
     // A doc pane can be asked to write its buffer back after the file -- or the
     // folder holding it -- was deleted underneath it, so recreate the parent
@@ -411,7 +561,9 @@ class WorkspaceManager {
   // and gives the pane's reload path one thing to compare against.
   // `error` means "cannot be shown"; `kind` is still set, so the pane can say
   // what it would have shown and offer to open it externally.
-  readDoc(rel) {
+  async readDoc(rel) {
+    const R = this.backend();
+    if (R) return R.readDoc(rel);
     const abs = this.resolveSafe(rel);
     const kind = docKind(rel);
     const stat = fs.statSync(abs);
@@ -442,27 +594,35 @@ class WorkspaceManager {
     return Object.assign(base, { text: buf.toString('utf8') });
   }
 
-  createFile(rel) {
+  async createFile(rel) {
+    const R = this.backend();
+    if (R) return R.createFile(rel);
     const abs = this.resolveSafe(rel);
     if (fs.existsSync(abs)) throw new Error('Already exists: ' + rel);
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, '');
   }
 
-  createFolder(rel) {
+  async createFolder(rel) {
+    const R = this.backend();
+    if (R) return R.createFolder(rel);
     const abs = this.resolveSafe(rel);
     if (fs.existsSync(abs)) throw new Error('Already exists: ' + rel);
     fs.mkdirSync(abs, { recursive: true });
   }
 
-  rename(fromRel, toRel) {
+  async rename(fromRel, toRel) {
+    const R = this.backend();
+    if (R) return R.rename(fromRel, toRel);
     fs.renameSync(this.resolveSafe(fromRel), this.resolveSafe(toRel));
   }
 
   // Copy a file from anywhere on disk into the active workspace inbox.
   // Deliberately a copy, not a move: the bridge watches ~/Downloads, which is
   // the user's folder, so nothing may disappear out of it.
-  ingest(absSource, providerId) {
+  async ingest(absSource, providerId) {
+    const R = this.backend();
+    if (R) return R.ingest(absSource, providerId);
     const inbox = this.inboxDir(providerId);
     fs.mkdirSync(inbox, { recursive: true });
     const base = path.basename(absSource);
@@ -477,21 +637,137 @@ class WorkspaceManager {
     return target;
   }
 
+  /* ----- local-path bridges -----
+   *
+   * The handful of features that can only be handed a real path on this
+   * machine: a <webview> showing a PDF, and the in-page file attach. For a
+   * remote space they get a cached copy instead of a refusal.
+   */
+
+  async localFileFor(rel) {
+    const R = this.backend();
+    return R ? R.cache(rel) : this.resolveSafe(rel);
+  }
+
+  // A pty needs a directory that exists on THIS machine. For a remote space the
+  // real working directory is set by the `cd` inside the ssh command, so the
+  // local cwd only has to be somewhere valid.
+  localCwd() {
+    return this.isRemote(this.active()) ? os.homedir() : this.getRoot();
+  }
+
+  // Chromium can only download to local disk, so a remote space's downloads
+  // land here first and are pushed up by ingest() once they finish.
+  stagingDir(providerId) {
+    if (!this.remoteHooks) throw new Error('Remote support is not wired up yet');
+    const dir = path.join(this.remoteHooks.cacheDir, 'staging', this.activeId(),
+                          providerId || '_desktop');
+    fs.mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  async disconnectAll() {
+    for (const c of this.conns.values()) {
+      try { await c.disconnect(); } catch {}
+    }
+  }
+
   /* ----- watchers ----- */
+
+  // Deepest level (0..maxDepth) whose cumulative path count still fits
+  // WATCH_BUDGET. Counting level by level and stopping early keeps this to the
+  // same readdir work `tree()` already does, and a workspace too big to watch
+  // fully degrades to a shallower watch -- deep changes stop auto-refreshing,
+  // which is a far better failure than every terminal losing its tty.
+  // `capped` separates "the tree simply ends here" from "the budget stopped
+  // us"; only the second is worth warning about, and most projects are the
+  // first.
+  watchPlan(root, maxDepth = 5, budget = WATCH_BUDGET) {
+    let level = [root];
+    let total = 1;
+    let fits = 0;
+    for (let d = 1; d <= maxDepth; d++) {
+      const next = [];
+      for (const dir of level) {
+        let entries;
+        try {
+          entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch {
+          continue;
+        }
+        for (const e of entries) {
+          if (IGNORE.has(e.name)) continue;
+          total++;
+          if (e.isDirectory()) next.push(path.join(dir, e.name));
+        }
+      }
+      if (total > budget) return { depth: fits, capped: true }; // deeper only grows
+      fits = d;
+      if (!next.length) return { depth: d, capped: false }; // tree bottoms out
+      level = next;
+    }
+    return { depth: fits, capped: false };
+  }
 
   watch(callback) {
     const chokidar = require('chokidar');
     if (this.watcher) this.watcher.close();
+    this.watcher = null;
+    clearInterval(this.poller);
+    this.poller = null;
+    if (this.isRemote(this.active())) return this.watchRemote(callback);
     let timer = null;
+    const { depth, capped } = this.watchPlan(this.getRoot());
+    if (capped) {
+      console.warn(
+        `[tote] ${this.getRoot()}: over ${WATCH_BUDGET} watchable paths, ` +
+          `watching to depth ${depth} only; deeper changes will not auto-refresh. ` +
+          `Add the generated cache dir to IGNORE in workspace.js to watch fully.`,
+      );
+    }
     this.watcher = chokidar.watch(this.getRoot(), {
       ignoreInitial: true,
-      depth: 5,
+      depth,
       ignored: (p) => IGNORE.has(path.basename(p)),
     });
     this.watcher.on('all', () => {
       clearTimeout(timer);
       timer = setTimeout(callback, 200);
     });
+  }
+
+  // A remote space has no inotify to bind and no descriptors to blow: it polls
+  // a fingerprint that the remote hashes for us, so the reply is one line
+  // whatever the project's size. Only the active space polls, and only while
+  // its connection is up -- a space whose host is asleep costs nothing.
+  //
+  // The fingerprint covers mtimes as well as names on purpose. The whole point
+  // of a remote space is an agent editing files in a terminal, and an open doc
+  // pane learns about that edit only through this tick.
+  watchRemote(callback) {
+    const space = this.active();
+    const every = Number(this.cfg.getSettings().remotePollMs) || 4000;
+    let last = null;
+    let busy = false;
+    const tick = async () => {
+      if (busy) return;                       // a slow link must not stack polls
+      const R = this.backend();
+      if (!R || this.activeId() !== space.id) return;
+      if (this.conn(space).state !== 'up') return;
+      busy = true;
+      try {
+        const now = await R.fingerprint();
+        if (last !== null && now !== last) callback();
+        last = now;
+      } catch {
+        // A dropped connection is the RemoteConn's problem to report, not a
+        // reason to spam the tree with refreshes.
+      } finally {
+        busy = false;
+      }
+    };
+    tick();
+    this.poller = setInterval(tick, every);
   }
 
   // Watches the OS Downloads folder to catch files saved by native apps, so

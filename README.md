@@ -78,6 +78,17 @@ run through your login shell, so a CLI that works in your own terminal works her
 including ones installed via fnm/nvm/asdf, which a desktop app otherwise can't see. Right-click a
 web tab for **reload** / **close**.
 
+### Install as a macOS app
+
+```bash
+npm run install:mac      # runs the tests, builds, installs to /Applications
+```
+
+Safe to run from a terminal docked inside Tote itself: the build is staged
+separately so the running bundle is never deleted underneath it, and since Tote
+holds a single-instance lock, the script leaves a watcher that reopens the
+updated app as soon as you quit the old one.
+
 ### Build real installers
 
 ```bash
@@ -106,6 +117,7 @@ unregisters it, and changing its folder just re-points it.
 | CLI agents | New PTY spawns with `cwd = <active>`; tab tagged with its space | solid |
 | Claude Desktop | MCP filesystem server bound to `<active>` written into `claude_desktop_config.json` (with .bak backup) before launch | solid (restart app if already open) |
 | Other native apps | Downloads-folder bridge: files the app downloads are copied into `<active>/inbox/_desktop/`, originals left in place | macOS only (toggle in Settings) |
+| Remote spaces | One multiplexed ssh connection per space: terminals are `ssh -tt` in a real PTY, the files pane reads over the same socket, downloads stage locally and are streamed up over that same connection | needs ssh access to the host (Tailscale SSH works as-is) |
 
 ## What's inside
 
@@ -118,6 +130,15 @@ unregisters it, and changing its folder just re-points it.
   adds a line** instead of sending the message. **Shift+↑/↓** scrolls back through a long
   answer (Shift+Home/End jump to the ends) — a bare arrow stays the agent's own history key. **Drag an image onto an agent pane**
   and it arrives as a path the agent can read, the way a native terminal does it. Green/red dots show what's on your PATH.
+- **Remote spaces** — `+r` on the strip opens a project that lives on **another machine**
+  over ssh, which is to say Tailscale works with no extra setup: give it a host
+  (`devbox`, or `user@devbox`) and a path, and you get the same space you always had —
+  files pane, file panes, groups, layout — except the tree, the edits and the agents all
+  run over there. Terminals are real PTYs with ssh inside, so Claude Code on the remote
+  behaves exactly as it does locally, Shift+Enter and all. One connection is shared by
+  everything and kept alive, so you authenticate rarely; when Tailscale's periodic check
+  *does* expire, the files pane says so and hands you a connect pane and the login link —
+  no modal, and nothing else you have open is interrupted.
 - **Temp spaces** — `+t` on the strip makes a throwaway space with no folder picker:
   name it (or take the generated one), work, then **discard** it from the chip's
   context menu and its files go with it. Changed your mind? **keep…** moves the
@@ -152,12 +173,16 @@ src/main/
   main.js          window, sessions, downloads routing, bridge, apps launcher, IPC
   installer.js     system checks, Claude MCP binding, MCP snippet, CLI status
   config.js        userData config store (JSON)
-  workspace.js     spaces registry, safe paths, tree, ingest(), chokidar watchers
-  ptyManager.js    node-pty sessions for CLI agents
+  workspace.js     spaces registry, safe paths, tree, ingest(), chokidar watchers,
+                   and backend dispatch (local folder vs remote host)
+  sshfix.js        pure: shell quoting, every remote command, ssh/Tailscale detectors
+  remote.js        one ssh connection per remote space + the remote file operations
+  ptyManager.js    node-pty sessions for CLI agents (local, or ssh for a remote space)
 src/preload/       contextBridge API (renderer has no node access)
 src/renderer/
   app.js           vanilla JS UI: spaces, groups, panes, tree, editor, xterm, wizard, settings
   layout.js        pure tiling engine (tree edits + geometry), tested by `npm test`
+  markdown.js      pure markdown parser for doc panes, tested by `npm test`
   npmfix.js        pure npm-output detectors for self-healing wizard installs
 ```
 
@@ -175,7 +200,6 @@ Design rules:
 
 - Global hotkey + tray (summon from anywhere)
 - Per-workspace download rules (e.g. `.zip` → `assets/`)
-- Git/Syncthing-backed space sync across machines
 - House agent via DeepSeek Harness plugin with workspace tools
 - Context bus: send selection/conversation between panes
 

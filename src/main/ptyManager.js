@@ -1,16 +1,13 @@
 // PTY manager: spawns CLI agents (Claude Code, Kimi CLI, ...) in real
 // pseudo-terminals so their TUIs render correctly in xterm.js.
+const S = require('./sshfix');
+
 let pty = null;
 let ptyLoadError = null;
 try {
   pty = require('node-pty');
 } catch (e) {
   ptyLoadError = e.message;
-}
-
-// Single-quote a word for the shell: end the quote, escape the quote, reopen.
-function shq(word) {
-  return `'${String(word).replace(/'/g, `'\\''`)}'`;
 }
 
 // What to actually hand pty.spawn() for a CLI profile.
@@ -22,7 +19,16 @@ function shq(word) {
 // terminal the same environment the user's own terminal has. It has to be
 // resolved per terminal rather than captured once, because setups like fnm
 // build their bin dir per shell and can switch node version by directory.
-function shellCommand(profile) {
+//
+// A remote space's terminal is still a real local pty -- it just has ssh in it,
+// so node-pty, xterm, SIGWINCH on resize, the Shift+Enter handler and the
+// scrollback keys are all untouched: ssh is transparent to a tty. It goes
+// through the *remote* login shell for exactly the reason above.
+function shellCommand(profile, remote) {
+  if (remote) {
+    return { file: 'ssh', args: S.termArgs({ host: remote.host, socket: remote.socket,
+                                             command: S.termCommand(remote.root, profile) }) };
+  }
   const args = profile.args || [];
   // Windows has no login-shell concept and PowerShell already starts with the
   // user's full PATH, so keep exec'ing directly there.
@@ -36,7 +42,7 @@ function shellCommand(profile) {
   // exec replaces the shell, so the agent ends up owning the PTY directly:
   // signals, exit code and TUI repaint behave exactly as before, and no prompt
   // is ever drawn.
-  const line = 'exec ' + [profile.command, ...args].map(shq).join(' ');
+  const line = 'exec ' + [profile.command, ...args].map(S.shq).join(' ');
   return { file: shell, args: ['-l', '-i', '-c', line] };
 }
 
@@ -50,11 +56,21 @@ class PtyManager {
     return { ok: !!pty, error: ptyLoadError };
   }
 
-  spawn(profile, cwd, cols, rows, sender) {
+  // `remote` is a live RemoteConn when the space lives on another machine; cwd
+  // is then only the local process's working directory, since the real one is
+  // set by the `cd` inside the ssh command.
+  spawn(profile, cwd, cols, rows, sender, remote) {
+    const { file, args } = shellCommand(profile, remote);
+    return this.launch({ file, args, cwd, cols, rows }, sender);
+  }
+
+  // The one place a pty is created. `onData`/`onExit` let the main process
+  // observe a session it is also streaming to the renderer -- which is how
+  // RemoteConn reads its own connect output while the user watches it in a pane.
+  launch({ file, args, cwd, cols, rows }, sender, onData, onExit) {
     if (!pty) {
       throw new Error('node-pty failed to load: ' + ptyLoadError);
     }
-    const { file, args } = shellCommand(profile);
     const proc = pty.spawn(file, args, {
       name: 'xterm-256color',
       cols: cols || 80,
@@ -66,14 +82,16 @@ class PtyManager {
     this.sessions.set(id, proc);
     proc.onData((data) => {
       try {
-        sender.send('pty:data', { id, data });
+        if (sender) sender.send('pty:data', { id, data });
       } catch {}
+      if (onData) onData(data);
     });
     proc.onExit(({ exitCode }) => {
       this.sessions.delete(id);
       try {
-        sender.send('pty:exit', { id, exitCode });
+        if (sender) sender.send('pty:exit', { id, exitCode });
       } catch {}
+      if (onExit) onExit(exitCode);
     });
     return id;
   }

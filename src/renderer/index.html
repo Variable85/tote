@@ -15,6 +15,7 @@
       <div id="ws-tabs"></div>
       <button id="btn-add-ws" class="plus" title="Add project workspace">+</button>
       <button id="btn-add-temp" class="plus" title="New temp space (deletable, swept when stale)">+t</button>
+      <button id="btn-add-remote" class="plus" title="New remote space (a project on another machine, over ssh/Tailscale)">+r</button>
       <div class="ws-actions">
         <div id="add-web-wrap">
           <button id="btn-add-tab" title="Open a web LLM pane"><span class="ico">＋</span>web</button>
@@ -58,6 +59,10 @@
             </div>
           </div>
           <div id="workspace-root" title=""></div>
+          <!-- Remote connection state. Ambient, never modal: a Tailscale check
+               expires on a timer, so this can appear mid-session while other
+               spaces are busy, and clicking it opens a connect PANE. -->
+          <div id="remote-bar" class="remote-bar hidden"></div>
           <div id="tree"></div>
         </aside>
         <div id="welcome">

@@ -11,6 +11,7 @@ const { ConfigStore } = require('./config');
 const { WorkspaceManager, originApp } = require('./workspace');
 const { PtyManager } = require('./ptyManager');
 const { systemCheck, fixNpmPrefix, claudeStatus, bindClaudeToWorkspace, mcpSnippet } = require('./installer');
+const { shq } = require('./sshfix');
 
 // LLM sites (Cloudflare-fronted ones especially) reject UAs that don't match
 // the real engine. Use Electron's own UA with the Electron/Tote tokens
@@ -118,19 +119,34 @@ function setupProviderSession(provider) {
   ses.setUserAgent(chromeUA(ses));
 
   ses.on('will-download', (event, item) => {
-    const inbox = workspace.inboxDir(provider.id);
+    // Chromium can only write to local disk, so a remote space downloads into a
+    // staging folder and the finished file is pushed up afterwards. Which space
+    // is active is read here, when the event fires, exactly as before.
+    const space = workspace.active();
+    const remote = workspace.isRemote(space);
+    const inbox = remote ? workspace.stagingDir(provider.id) : workspace.inboxDir(provider.id);
     fs.mkdirSync(inbox, { recursive: true });
     const target = uniquePath(path.join(inbox, item.getFilename() || 'download'));
     item.setSavePath(target);
-    item.once('done', (e, state) => {
+    item.once('done', async (e, state) => {
+      let landed = target;
+      let outcome = state;
+      if (remote && state === 'completed') {
+        try {
+          landed = await workspace.ingestInto(space.id, target, provider.id);
+          fs.rmSync(target, { force: true });        // the staged copy has served its purpose
+        } catch (err) {
+          outcome = 'interrupted: ' + err.message;   // the file is still in staging
+        }
+      }
       if (win) {
         win.webContents.send('download:done', {
           providerId: provider.id,
           provider: provider.name,
-          workspace: workspace.active().name,
-          filename: path.basename(target),
-          path: target,
-          state,
+          workspace: space.name,
+          filename: path.basename(landed),
+          path: landed,
+          state: outcome,
         });
       }
     });
@@ -181,7 +197,7 @@ function applyBridgeSetting() {
     // AirDrop): not ours to touch.
     if (!app || !bridgeAllowlist().has(app.toLowerCase())) return;
     try {
-      const target = workspace.ingest(absPath, '_desktop');
+      const target = await workspace.ingest(absPath, '_desktop');
       if (win) {
         win.webContents.send('download:done', {
           providerId: '_desktop',
@@ -310,6 +326,14 @@ function createWindow() {
   });
   win.loadFile(path.join(__dirname, '..', 'renderer', 'index.html'));
 
+  // On macOS the app outlives its window (`window-all-closed` only quits
+  // elsewhere) and every call on a destroyed BrowserWindow throws "Object has
+  // been destroyed". Drop the reference so the `if (win)` guards on the
+  // download pushes, the watcher and `second-instance` mean "a live window".
+  win.on('closed', () => {
+    win = null;
+  });
+
   // The sweep already ran at startup; the renderer can only be told once it has
   // a toast area to show it in.
   win.webContents.once('did-finish-load', () => {
@@ -375,7 +399,12 @@ ipcMain.handle('workspaces:setActive', (e, id) => {
   return ws;
 });
 
-ipcMain.handle('workspaces:remove', (e, id) => {
+ipcMain.handle('workspaces:remove', async (e, id) => {
+  const space = workspace.list().find((w) => w.id === id);
+  if (space && workspace.isRemote(space)) {
+    try { await workspace.conn(space).disconnect(); } catch {}
+    workspace.conns.delete(id);
+  }
   workspace.remove(id);
   watchActive();
   return wsState();
@@ -411,6 +440,39 @@ ipcMain.handle('workspaces:setPath', async (e, id) => {
 // --- IPC: temp (scratch) spaces --------------------------------------------
 // A temp space skips the folder picker and can be deleted, files included --
 // the one exception to "removing a space never touches the disk".
+
+// --- IPC: remote spaces --------------------------------------------------------------------
+
+// Registering and connecting are deliberately separate. The space exists the
+// moment it is named, so the connect pane -- and every later reconnect, of which
+// there will be many, because Tailscale's check expires on a timer -- runs
+// against a real space through exactly one code path.
+ipcMain.handle('workspaces:addRemote', (e, { name, host, path: remotePath }) => {
+  const id = workspace.addRemote(name, host, remotePath);
+  workspace.setActive(id);
+  watchActive();
+  return wsState();
+});
+
+// Opens the one interactive ssh session that may authenticate, and hands the
+// renderer its pty id so it can mount it as an ordinary terminal pane.
+ipcMain.handle('remote:connect', (e, { id, cols, rows, mkdir }) => {
+  const space = workspace.list().find((w) => w.id === id) || workspace.active();
+  if (!workspace.isRemote(space)) throw new Error('Not a remote space: ' + space.name);
+  const conn = workspace.conn(space);
+  conn.connect({ cols, rows, sender: e.sender, mkdir }).then(() => {
+    if (workspace.activeId() === space.id) watchActive();   // start polling once up
+  });
+  return conn.info();
+});
+
+ipcMain.handle('remote:state', (e, id) => workspace.remoteState(id));
+
+ipcMain.handle('remote:disconnect', async (e, id) => {
+  const space = workspace.list().find((w) => w.id === id);
+  if (space && workspace.isRemote(space)) await workspace.conn(space).disconnect();
+  return workspace.remoteState(id);
+});
 
 ipcMain.handle('workspaces:tempName', () => workspace.suggestTempName());
 
@@ -485,7 +547,9 @@ ipcMain.handle('workspace:rename', (e, from, to) => {
   return true;
 });
 ipcMain.handle('workspace:trash', async (e, rel) => {
-  await shell.trashItem(workspace.resolveSafe(rel));
+  const R = workspace.backend();
+  if (R) await R.trash(rel);                 // moves into the space's .tote-trash/
+  else await shell.trashItem(workspace.resolveSafe(rel));
   return true;
 });
 ipcMain.handle('workspace:openPath', (e, rel) => shell.openPath(workspace.resolveSafe(rel)));
@@ -564,6 +628,9 @@ ipcMain.handle('setup:fixNpmPrefix', () => fixNpmPrefix());
 ipcMain.handle('conn:claudeStatus', () => claudeStatus());
 
 ipcMain.handle('conn:bindClaude', () => {
+  if (workspace.isRemote(workspace.active())) {
+    throw new Error('Claude Desktop runs on this machine and cannot be bound to a remote space');
+  }
   const cfgPath = bindClaudeToWorkspace(workspace.getRoot());
   return { cfgPath, workspace: workspace.active().name, root: workspace.getRoot() };
 });
@@ -580,7 +647,7 @@ ipcMain.handle('pty:run', (e, { command, args }) => {
     cmd = parts[0];
     argv = parts.slice(1);
   }
-  const id = ptys.spawn({ command: cmd, args: argv }, workspace.getRoot(), 110, 28, e.sender);
+  const id = ptys.spawn({ command: cmd, args: argv }, workspace.localCwd(), 110, 28, e.sender);
   return { id };
 });
 
@@ -597,7 +664,7 @@ ipcMain.handle('provider:ensureLocal', async (e, providerId) => {
 // into the page's file input (or firing a synthetic drop event).
 const SEND_FILE_MAX = 15 * 1024 * 1024;
 ipcMain.handle('tab:sendFile', async (e, { wcId, relPath }) => {
-  const abs = workspace.resolveSafe(relPath);
+  const abs = await workspace.localFileFor(relPath);
   const stat = fs.statSync(abs);
   if (stat.size > SEND_FILE_MAX) throw new Error('File too large for in-page attach (> 15 MB)');
   const wc = webContents.fromId(wcId);
@@ -630,20 +697,37 @@ ipcMain.handle('tab:sendFile', async (e, { wcId, relPath }) => {
 
 ipcMain.handle('pty:available', () => ptys.available());
 
-ipcMain.handle('pty:spawn', (e, { profileId, cols, rows }) => {
+ipcMain.handle('pty:spawn', async (e, { profileId, cols, rows }) => {
   const profile = configStore.getCliProfiles().find((p) => p.id === profileId);
   if (!profile) throw new Error('Unknown CLI profile: ' + profileId);
-  const cwd = workspace.getRoot();
-  const id = ptys.spawn(profile, cwd, cols, rows, e.sender);
-  return { id, workspace: workspace.active().name, cwd };
+  const space = workspace.active();
+  const conn = workspace.isRemote(space) ? workspace.conn(space) : null;
+  // Try to heal silently first: after a sleep the master is usually just gone,
+  // and rebuilding it needs no human at all. Only send the user to the connect
+  // pane when it genuinely needs one.
+  if (conn && conn.state !== 'up' && !(await conn.silentConnect())) {
+    throw new Error(`${conn.host}: ${conn.message} — use the connect button in the files pane`);
+  }
+  const cwd = workspace.localCwd();
+  const id = ptys.spawn(profile, cwd, cols, rows, e.sender, conn);
+  return { id, workspace: space.name, cwd: conn ? conn.root : cwd, host: conn ? conn.host : null };
 });
 
 ipcMain.on('pty:write', (e, { id, data }) => ptys.write(id, data));
 ipcMain.on('pty:resize', (e, { id, cols, rows }) => ptys.resize(id, cols, rows));
 ipcMain.on('pty:kill', (e, { id }) => ptys.kill(id));
 
-ipcMain.handle('cli:check', (e, command) => {
+ipcMain.handle('cli:check', async (e, command) => {
   if (!command) return true; // plain shell profile always works
+  // A remote space runs the agent on the remote, so that is where it has to
+  // exist -- checking this machine would report the opposite of the truth.
+  const R = workspace.backend();
+  if (R) {
+    try {
+      await R.conn.run(`command -v ${shq(command)} >/dev/null`);
+      return true;
+    } catch { return false; }
+  }
   try {
     const cmd =
       process.platform === 'win32' ? `where "${command}"` : `command -v "${command}"`;
@@ -669,10 +753,15 @@ if (!gotLock) {
   app.quit();
 } else {
   app.on('second-instance', () => {
-    if (win) {
-      if (win.isMinimized()) win.restore();
-      win.focus();
+    // No window means it was closed with the app still alive (macOS): open one,
+    // as `activate` does. Before ready there is nothing to do -- `whenReady`
+    // is about to create it.
+    if (!win) {
+      if (app.isReady()) createWindow();
+      return;
     }
+    if (win.isMinimized()) win.restore();
+    win.focus();
   });
 
   app.whenReady().then(() => {
@@ -684,8 +773,27 @@ if (!gotLock) {
     // mid-session. The report is pushed once the window can show a toast.
     swept = workspace.sweepTemp(configStore.getSettings().scratchDays ?? 7);
     ptys = new PtyManager();
+    // RemoteConn needs a pty it can both stream to a pane and read itself, plus
+    // the userData paths; main.js is the only layer that has all three.
+    workspace.configureRemote({
+      socketDir: path.join(app.getPath('userData'), 'ssh'),
+      cacheDir: path.join(app.getPath('userData'), 'remote'),
+      launchPty: (spec, sender, onData, onExit) => ptys.launch(spec, sender, onData, onExit),
+      onState: (info) => { if (win) win.webContents.send('remote:state', info); },
+      // Tailscale's check blocks the ssh session until this page is visited, so
+      // opening it is what unblocks the connect -- and it goes to the system
+      // browser, where the user's Tailscale login already lives.
+      onAuthUrl: (url) => shell.openExternal(url),
+    });
     setupAllProviderSessions();
     detectApps();
+    // If the active space is remote, its master is very likely still up from
+    // the last run. Try it silently before the window appears, so the usual case
+    // is a tree that is simply there.
+    const active = workspace.active();
+    if (workspace.isRemote(active)) {
+      workspace.conn(active).silentConnect().then(() => watchActive()).catch(() => {});
+    }
     watchActive();
     applyBridgeSetting();
     createWindow();
@@ -697,6 +805,9 @@ if (!gotLock) {
 
   app.on('window-all-closed', () => {
     ptys && ptys.killAll();
+    // The ssh masters are deliberately left running: ControlPersist=yes outlives
+    // Tote, so the next launch reconnects to a still-authenticated connection
+    // instead of sending the user back to a browser login.
     if (process.platform !== 'darwin') app.quit();
   });
 }

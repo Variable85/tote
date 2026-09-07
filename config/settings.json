@@ -1,5 +1,6 @@
 {
   "bridgeDownloads": true,
   "setupDone": false,
-  "scratchDays": 7
+  "scratchDays": 7,
+  "remotePollMs": 4000
 }

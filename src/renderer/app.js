@@ -20,6 +20,9 @@ const state = {
   docs: new Map(), // docId -> { path, kind, text, savedText, dataUrl, fileUrl, mtimeMs, size, error, stale }
   docOrder: [], // doc leaf ids, least recently focused first -- which pane a click retargets
   wsDrag: null, // id of the workspace tab being dragged along the strip
+  remote: {}, // spaceId -> { state, host, root, message, url } pushed from main
+  ptyPending: new Map(), // ptyId -> output that arrived before a pane claimed it
+  treeWs: null, // which space state.treeData belongs to -- see refreshTree
 };
 
 /* ---------------- toasts ---------------- */
@@ -68,20 +71,41 @@ function renderWorkspaceSwitcher() {
   for (const w of state.workspaces.list) {
     const tab = document.createElement('div');
     tab.className = 'ws-tab' + (w.id === state.workspaces.active ? ' active' : '')
-      + (w.temp ? ' temp' : '');
+      + (w.temp ? ' temp' : '') + (isRemote(w) ? ' remote' : '');
     const glyph = document.createElement('span');
     glyph.className = 'glyph';
-    glyph.textContent = w.temp ? '◌' : w.id === 'global' ? '◈' : '◇';
+    glyph.textContent = isRemote(w) ? '⇄' : w.temp ? '◌' : w.id === 'global' ? '◈' : '◇';
     tab.append(glyph, document.createTextNode(w.name));
-    tab.title = (w.temp ? 'temp space — discarding deletes its files\n' : '') + w.path;
+    // The dot badges from every space, so a connection that needs you is
+    // visible while you are working somewhere else.
+    if (isRemote(w)) {
+      const dot = document.createElement('span');
+      const info = remoteInfo(w.id);
+      dot.className = 'conn ' + remoteTone(info);
+      dot.title = info ? info.message : 'not connected';
+      tab.appendChild(dot);
+    }
+    tab.title = (w.temp ? 'temp space — discarding deletes its files\n' : '')
+      + (isRemote(w) ? w.host + ':' + w.path + '\n' + (remoteInfo(w.id) || {}).message : w.path);
     tab.onclick = () => switchWorkspace(w.id);
     tab.oncontextmenu = (e) => {
       e.preventDefault();
       hideContextMenu();
       const menu = $('#context-menu');
       menu.innerHTML = '';
-      menu.appendChild(ctxItem('open folder', () => tote.openPath('.')));
-      menu.appendChild(ctxItem('copy path', () => navigator.clipboard.writeText(w.path)));
+      if (isRemote(w)) {
+        menu.appendChild(ctxItem('connect / re-authenticate…', () => {
+          switchWorkspace(w.id).then(() => connectRemote());
+        }));
+        menu.appendChild(ctxItem('disconnect', async () => {
+          state.remote[w.id] = await tote.remoteDisconnect(w.id);
+          renderRemote();
+        }));
+      } else {
+        menu.appendChild(ctxItem('open folder', () => tote.openPath('.')));
+      }
+      menu.appendChild(ctxItem('copy path', () => navigator.clipboard.writeText(
+        isRemote(w) ? w.host + ':' + w.path : w.path)));
       menu.appendChild(ctxItem('rename…', () => renameWorkspace(w)));
       menu.appendChild(ctxItem('change folder…', () => changeWorkspaceFolder(w)));
       if (w.temp) {
@@ -141,8 +165,9 @@ function renderWorkspaceSwitcher() {
     moveWorkspace(state.wsDrag, null, true);
   };
   const ws = activeWorkspace();
-  $('#workspace-root').textContent = ws ? ws.path : '';
-  $('#workspace-root').title = ws ? ws.path : '';
+  const label = ws ? (isRemote(ws) ? ws.host + ':' + ws.path : ws.path) : '';
+  $('#workspace-root').textContent = label;
+  $('#workspace-root').title = label;
 }
 
 function clearWsDropMark() {
@@ -173,6 +198,7 @@ async function switchWorkspace(id) {
   try {
     await tote.setActiveWorkspace(id);
     state.workspaces = await tote.listWorkspaces();
+    if (isRemote(activeWorkspace())) state.remote[id] = await tote.remoteState(id);
     renderWorkspaceSwitcher();
     showWorkspaceViews();
     await refreshTree();
@@ -267,6 +293,7 @@ async function addTempWorkspace() {
 }
 
 $('#btn-add-temp').onclick = addTempWorkspace;
+$('#btn-add-remote').onclick = addRemoteWorkspace;
 
 // Main measures the folder, names the terminals it will kill, and confirms.
 // Panes come down only after the delete succeeded, so a cancel leaves nothing
@@ -312,6 +339,148 @@ async function promoteWorkspace(ws) {
 tote.onWorkspacesSwept((list) => {
   toast('Swept ' + list.length + ' stale temp space(s): ' + list.map((w) => w.name).join(', '), 'success');
 });
+
+/* ---------------- remote spaces ----------------
+ *
+ * A space is remote iff it carries a host; everything else about it -- groups,
+ * panes, downloads, terminals -- is unchanged.
+ *
+ * Connecting is not a setup step. Tailscale SSH's check expires on a timer, so
+ * a space that worked an hour ago can need a browser round trip now, mid-session
+ * and while other spaces are busy. That is why the connect session is an
+ * ordinary pane and the prompt to open it is an ambient banner: nothing here is
+ * ever modal, and re-authenticating and first-connecting are the same code. */
+
+function isRemote(w) {
+  return !!(w && w.host);
+}
+
+function remoteInfo(id = state.workspaces.active) {
+  return state.remote[id] || null;
+}
+
+// Amber for "you can fix this", red for "something is wrong", green for up.
+// Amber = you can fix this from here, red = something is wrong with the host or
+// the config, grey = simply not connected yet. Every kind classify() can return
+// needs an entry: a missing one falls through to grey, which would show a real
+// failure as if nothing had happened.
+const REMOTE_TONE = {
+  up: 'ok', connecting: 'busy',
+  auth: 'warn', hostKey: 'warn', socketDead: 'warn',
+  hostKeyChanged: 'bad', denied: 'bad', unreachable: 'bad',
+  unknownHost: 'bad', noSuchUser: 'bad', error: 'bad',
+  idle: 'off', down: 'off',
+};
+
+function remoteTone(info) {
+  return (info && REMOTE_TONE[info.state]) || 'off';
+}
+
+async function addRemoteWorkspace() {
+  // user@host, spelled out: Tailscale SSH maps the tailnet identity onto a LOCAL
+  // account on the remote, so the bare hostname only works when your local
+  // username happens to exist over there -- which is usually does not.
+  const host = await askInput('Remote host — user@host, e.g. me@devbox (a tailnet name works)');
+  if (!host) return null;
+  const remotePath = await askInput('Path on ' + host, '~/');
+  if (!remotePath) return null;
+  const name = await askInput('Name this space', host);
+  if (!name) return null;
+  try {
+    state.workspaces = await tote.addRemoteWorkspace(name, host, remotePath);
+    renderWorkspaceSwitcher();
+    showWorkspaceViews();
+    await refreshTree();
+    connectRemote({ mkdir: true });        // a new space may name a folder that does not exist yet
+    return true;
+  } catch (e) {
+    toast(e.message, 'error');
+    return null;
+  }
+}
+
+// Opens the one ssh session that is allowed to authenticate, as a pane. Every
+// way it can stall wants a human at a terminal: an unknown host key, a key
+// passphrase, and Tailscale's "visit this URL", which blocks the session until
+// the browser round trip finishes and then continues on its own.
+async function connectRemote({ mkdir = false } = {}) {
+  const w = activeWorkspace();
+  if (!isRemote(w)) return;
+  // A connect already in flight owns a pane and a pty; a second one would put
+  // two xterms on the same session, both echoing and both writing.
+  const open = remoteInfo(w.id);
+  if (open && open.state === 'connecting' && open.ptyId) {
+    const live = [...state.terms.values()].find((t) => t.ptyId === open.ptyId);
+    if (live) { focusPane(live.pane.el.dataset.leaf); live.term.focus(); return; }
+  }
+  const ctx = createTermPane('connect ' + w.host);
+  const { term } = ctx;
+  term.writeln('\x1b[90m[Tote] connecting to ' + w.host + ' — answer anything it asks here\x1b[0m');
+  try {
+    const info = await tote.remoteConnect(w.id, term.cols || 80, term.rows || 24, mkdir);
+    state.remote[w.id] = info;
+    renderRemote();
+    if (info.ptyId) attachPty(ctx, info.ptyId);
+  } catch (e) {
+    term.writeln('\x1b[31mCould not connect:\x1b[0m ' + e.message);
+    ctx.pane.el.classList.add('dead');
+  }
+}
+
+// Everything the connection state drives: the space chip, the files banner, and
+// the tree once it comes up.
+function renderRemote() {
+  renderWorkspaceSwitcher();
+  renderRemoteBanner();
+}
+
+function renderRemoteBanner() {
+  const bar = $('#remote-bar');
+  const w = activeWorkspace();
+  const info = remoteInfo();
+  bar.innerHTML = '';
+  // Up, or not remote at all: nothing to say.
+  if (!isRemote(w) || (info && info.state === 'up')) {
+    bar.classList.add('hidden');
+    return;
+  }
+  bar.classList.remove('hidden');
+  bar.className = 'remote-bar ' + remoteTone(info);
+
+  const line = document.createElement('div');
+  line.className = 'remote-msg';
+  line.textContent = info ? info.message : 'Not connected to ' + w.host;
+  bar.appendChild(line);
+
+  const acts = document.createElement('div');
+  acts.className = 'remote-actions';
+  const button = (label, fn) => {
+    const b = document.createElement('button');
+    b.textContent = label;
+    b.onclick = fn;
+    acts.appendChild(b);
+  };
+  // The login page is offered as well as opened: the automatic open happens once
+  // per attempt, and the user may have closed the tab or been on another screen.
+  if (info && info.url) button('open login page', () => tote.openExternal(info.url));
+  if (!info || info.state !== 'connecting') {
+    button(info && info.state === 'auth' ? 'retry' : 'connect', () => connectRemote());
+  }
+  bar.appendChild(acts);
+}
+
+// Pushed from main whenever a connection changes state -- including while the
+// user is in a different space, which is why the chip badges too.
+function onRemoteState(info) {
+  const was = state.remote[info.id];
+  state.remote[info.id] = info;
+  renderRemote();
+  // Came up: the tree was empty or stale, and the poller has just been armed.
+  if (info.state === 'up' && (!was || was.state !== 'up') && info.id === state.workspaces.active) {
+    refreshTree();
+    recheckDocs();
+  }
+}
 
 /* ---------------- web tabs (per workspace) ----------------
  * A workspace owns a list of tab instances (several of the same provider are
@@ -426,8 +595,36 @@ document.addEventListener('click', () => $('#tab-add-menu').classList.add('hidde
 
 /* ---------------- workspace tree ---------------- */
 async function refreshTree() {
-  state.treeData = await tote.tree();
+  const ws = state.workspaces.active;
+  try {
+    state.treeData = await tote.tree();
+    state.treeWs = ws;
+  } catch (e) {
+    // A disconnected remote is a state, not a failure, and the banner carries
+    // the reason -- but what is already on screen decides what to do with it.
+    //
+    // Keeping the old tree is only right when it is THIS space's: a blip while
+    // connected should not blank a listing that is merely stale. When it
+    // belongs to another space it has to go, or the pane shows one space's
+    // files under another's header and invites a click on a file that is not
+    // there. That is the same rule panes follow -- never show another
+    // workspace's view -- and it is why an empty tree is acceptable here: the
+    // banner above it is what stops it reading as "this project has no files".
+    if (state.treeWs !== ws) {
+      state.treeData = [];
+      state.treeWs = ws;
+      renderTree();
+    }
+    if (isRemote(activeWorkspace())) {
+      state.remote[ws] = await tote.remoteState(ws);
+      renderRemote();
+      return;
+    }
+    toast(e.message, 'error');
+    return;
+  }
   renderTree();
+  renderRemoteBanner();
 }
 
 function renderTree() {
@@ -506,21 +703,29 @@ function showContextMenu(x, y, node) {
   const menu = $('#context-menu');
   menu.innerHTML = '';
   const parentDir = node.path.includes('/') ? node.path.slice(0, node.path.lastIndexOf('/')) : '.';
+  // Handing a file to this machine's file manager or default app cannot mean
+  // anything for a file on another machine, so those entries are simply absent
+  // rather than present and failing.
+  const local = !isRemote(activeWorkspace());
 
   if (node.type === 'file') {
     menu.appendChild(ctxItem('Open', () => openFile(node)));
     if (node.kind !== 'binary') {
       menu.appendChild(ctxItem('Open in new pane', () => openDoc(node.path, { newPane: true })));
     }
-    menu.appendChild(ctxItem('Open externally', () => tote.openPath(node.path)));
-    menu.appendChild(ctxItem(REVEAL_LABEL, () => tote.revealPath(node.path)));
+    if (local) {
+      menu.appendChild(ctxItem('Open externally', () => tote.openPath(node.path)));
+      menu.appendChild(ctxItem(REVEAL_LABEL, () => tote.revealPath(node.path)));
+    }
     menu.appendChild(ctxItem('Send to active tab (experimental)', () => sendToTab(node.path)));
     menu.appendChild(ctxItem('Copy path', () => navigator.clipboard.writeText(node.path)));
   } else {
     menu.appendChild(ctxItem('New file here', () => newFile(node.path)));
     menu.appendChild(ctxItem('New folder here', () => newFolder(node.path)));
-    menu.appendChild(ctxItem('Open externally', () => tote.openPath(node.path)));
-    menu.appendChild(ctxItem(REVEAL_LABEL, () => tote.revealPath(node.path)));
+    if (local) {
+      menu.appendChild(ctxItem('Open externally', () => tote.openPath(node.path)));
+      menu.appendChild(ctxItem(REVEAL_LABEL, () => tote.revealPath(node.path)));
+    }
   }
   menu.appendChild(Object.assign(document.createElement('div'), { className: 'ctx-sep' }));
   menu.appendChild(
@@ -538,7 +743,8 @@ function showContextMenu(x, y, node) {
   );
   menu.appendChild(
     ctxItem('Delete', async () => {
-      if (!confirm(`Move "${node.name}" to trash?`)) return;
+      const where = isRemote(activeWorkspace()) ? '.tote-trash/ on ' + activeWorkspace().host : 'trash';
+      if (!confirm(`Move "${node.name}" to ${where}?`)) return;
       try {
         await tote.trash(node.path);
         refreshTree();
@@ -1221,14 +1427,19 @@ async function renderTermMenu() {
   const menu = $('#term-menu');
   menu.innerHTML = '';
   for (const p of state.profiles) {
-    if (!state.cliAvail.has(p.id)) {
-      state.cliAvail.set(p.id, await tote.checkCommand(p.command));
+    // Which machine the agent must exist on depends on the space, so this is
+    // cached per space: a remote host and this laptop rarely have the same set.
+    const key = state.workspaces.active + '|' + p.id;
+    if (!state.cliAvail.has(key)) {
+      state.cliAvail.set(key, await tote.checkCommand(p.command));
     }
     const item = document.createElement('div');
     item.className = 'term-menu-item';
     const dot = document.createElement('span');
-    dot.className = 'avail ' + (state.cliAvail.get(p.id) ? 'ok' : 'missing');
-    dot.title = state.cliAvail.get(p.id) ? 'found on PATH' : 'not found on PATH';
+    const found = state.cliAvail.get(key);
+    const where = isRemote(activeWorkspace()) ? activeWorkspace().host : 'this machine';
+    dot.className = 'avail ' + (found ? 'ok' : 'missing');
+    dot.title = (found ? 'found on PATH on ' : 'not found on PATH on ') + where;
     item.appendChild(dot);
     item.appendChild(document.createTextNode(p.name));
     const cmd = document.createElement('span');
@@ -1268,9 +1479,13 @@ function acceptFileDrop(el, onPaths) {
   });
 }
 
-async function spawnTerm(profile) {
+// A terminal pane, up to the point where something has to be attached to it.
+// Two things use this: an agent terminal, and a remote space's connect session
+// -- which is a pane rather than a modal precisely because re-authenticating is
+// not a one-off setup step, and must not interrupt whatever else is open.
+function createTermPane(title) {
   const id = ++state.termSeq;
-  const pane = paneShell('term:' + id, profile.name);
+  const pane = paneShell('term:' + id, title);
 
   const term = new Terminal({
     fontFamily: '"SF Mono", Menlo, Consolas, monospace',
@@ -1290,7 +1505,7 @@ async function spawnTerm(profile) {
   }
   term.open(pane.body);
 
-  const entry = { term, fit, ptyId: null, localId: id, pane, name: profile.name,
+  const entry = { term, fit, ptyId: null, localId: id, pane, name: title,
                   wsId: state.workspaces.active, alive: false };
   state.terms.set(id, entry);
 
@@ -1339,18 +1554,30 @@ async function spawnTerm(profile) {
   // PTY must be created at the true size, not 80x24.
   openPane(T.leaf(newLeafId(), 'term', id));
   if (fit) { try { fit.fit(); } catch {} }
+  return { id, entry, term, fit, pane };
+}
 
+// Bind a created pane to a pty id returned by main, in both directions.
+function attachPty(ctx, ptyId) {
+  ctx.entry.ptyId = ptyId;
+  ctx.entry.alive = true;
+  const early = state.ptyPending.get(ptyId);
+  if (early) { ctx.term.write(early); state.ptyPending.delete(ptyId); }
+  ctx.term.onData((d) => tote.ptyWrite(ptyId, d));
+  if (ctx.fit) { try { ctx.fit.fit(); } catch {} }   // the pane may have resized while spawning
+  tote.ptyResize(ptyId, ctx.term.cols, ctx.term.rows);
+  ctx.term.focus();
+}
+
+async function spawnTerm(profile) {
+  const ctx = createTermPane(profile.name);
+  const { term, pane } = ctx;
   try {
     const res = await tote.ptySpawn(profile.id, term.cols || 80, term.rows || 24);
-    entry.ptyId = res.id;
-    entry.alive = true;
-    term.writeln('\x1b[90m[Tote] workspace "' + res.workspace + '" · cwd ' + res.cwd + '\x1b[0m');
+    const where = res.host ? res.host + ':' + res.cwd : res.cwd;
+    term.writeln('\x1b[90m[Tote] workspace "' + res.workspace + '" · cwd ' + where + '\x1b[0m');
     if (profile.hint) term.writeln('\x1b[33m' + profile.hint + '\x1b[0m');
-    term.onData((d) => tote.ptyWrite(res.id, d));
-    // The pane may have been resized while spawning; push the real size now.
-    if (fit) { try { fit.fit(); } catch {} }
-    tote.ptyResize(res.id, term.cols, term.rows);
-    term.focus();
+    attachPty(ctx, res.id);
   } catch (e) {
     term.writeln('\x1b[31mCould not start ' + profile.name + ':\x1b[0m ' + e.message);
     pane.el.classList.add('dead');
@@ -1391,12 +1618,25 @@ tote.onPtyData((ptyId, data) => {
     // Buffer for the post-exit npm diagnostics; warnings sit at the tail, so
     // keeping only the newest chunk is safe if an install gets chatty.
     wizBuf = (wizBuf + data).slice(-131072);
+    return;
+  }
+  // Main starts streaming the moment it spawns, which is before the IPC reply
+  // carrying the id has come back -- so the first output of every pty arrives
+  // unclaimed. It matters most for a remote connect, where those first lines are
+  // the host-key question or the Tailscale login URL.
+  state.ptyPending.set(ptyId, ((state.ptyPending.get(ptyId) || '') + data).slice(-65536));
+  // A pty that dies before its pane claims it keeps its output, so attachPty can
+  // still show why -- but the map must not grow forever. Insertion order is
+  // oldest-first, so the stalest entry is the one to drop.
+  while (state.ptyPending.size > 16) {
+    state.ptyPending.delete(state.ptyPending.keys().next().value);
   }
 });
 
 tote.onPtyExit((ptyId, code) => {
   for (const t of state.terms.values()) {
     if (t.ptyId === ptyId) {
+      state.ptyPending.delete(ptyId);   // claimed: there is nothing left to replay
       t.alive = false;
       if (t.pane) t.pane.el.classList.add('dead');
       t.term.writeln('\r\n\x1b[90m[process exited with code ' + code + ']\x1b[0m');
@@ -2481,6 +2721,7 @@ $('#btn-run-wizard').onclick = () => {
 
 /* ---------------- events from main ---------------- */
 tote.onWorkspaceChanged(() => { refreshTree(); recheckDocs(); });
+tote.onRemoteState(onRemoteState);
 
 tote.onDownloadDone((m) => {
   if (m.state === 'completed') {
@@ -2504,6 +2745,11 @@ tote.onDownloadDone((m) => {
   state.workspaces = await tote.listWorkspaces();
   state.views = (await tote.getViews()) || {};
   adoptLeafSeq(state.views);   // never re-issue a persisted pane id
+  // Control sockets outlive Tote (ControlPersist=yes), so a remote space is
+  // usually already connected by the time we ask -- which is the point.
+  for (const w of state.workspaces.list.filter(isRemote)) {
+    try { state.remote[w.id] = await tote.remoteState(w.id); } catch {}
+  }
   renderWorkspaceSwitcher();
   showWorkspaceViews();
   await refreshTree();

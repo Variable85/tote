@@ -6,3 +6,4 @@ src/renderer/vendor/
 .DS_Store
 .remember/
 inbox/
+dist-next/

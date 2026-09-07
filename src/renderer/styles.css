@@ -217,6 +217,37 @@ body.dragging { user-select: none; }
 .ws-tab.temp { border: 1px dashed #6b5a2b; }
 .ws-tab.temp .glyph { color: #d9a441; }
 
+/* Remote spaces. The connection dot badges from every space, not just the
+   active one: a Tailscale check expiring while you work elsewhere has to be
+   visible without switching to find out. */
+.ws-tab.remote .glyph { color: #4fb3ff; }
+.ws-tab .conn {
+  width: 6px; height: 6px; border-radius: 50%; margin-left: 6px; flex-shrink: 0;
+}
+.ws-tab .conn.ok { background: #3dd68c; }
+.ws-tab .conn.warn { background: #d9a441; box-shadow: 0 0 0 2px rgba(217, 164, 65, 0.25); }
+.ws-tab .conn.bad { background: #e5484d; box-shadow: 0 0 0 2px rgba(229, 72, 77, 0.25); }
+.ws-tab .conn.busy { background: #4fb3ff; animation: conn-pulse 1.2s ease-in-out infinite; }
+.ws-tab .conn.off { background: #3a445c; }
+@keyframes conn-pulse { 50% { opacity: 0.25; } }
+
+/* Files-pane banner: why the tree is not there, and the one action that fixes
+   it. Never a modal -- re-authenticating is routine, not a setup step. */
+.remote-bar {
+  margin: 6px 8px; padding: 8px 10px; border-radius: 6px; font-size: 11px;
+  background: #141c2e; border: 1px solid #2a3654; color: #c6d0e6;
+}
+.remote-bar.warn { border-color: #6b5a2b; background: #1c1a12; }
+.remote-bar.bad { border-color: #6b2b2f; background: #1e1214; }
+.remote-bar.busy { border-color: #2a4a6b; }
+.remote-bar .remote-msg { line-height: 1.4; }
+.remote-bar .remote-actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
+.remote-bar button {
+  padding: 3px 8px; font-size: 11px; border-radius: 4px; cursor: pointer;
+  background: #1e2942; color: #dbe2f0; border: 1px solid #2a3654;
+}
+.remote-bar button:hover { background: #27355a; }
+
 /* workspace tag on terminal tabs */
 .term-tab .ws-tag {
   font-size: 10px;

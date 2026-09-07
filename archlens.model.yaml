@@ -182,6 +182,8 @@ systems:
     name: ptyManager
     kind: module
     class_name: src/main/ptyManager.js
+    depends_on:
+    - main.sshfix
     signals:
     - name: pty:data
       args: []
@@ -201,6 +203,18 @@ systems:
       - name: rows
         type: unknown
       - name: sender
+        type: unknown
+      - name: remote
+        type: unknown
+    - name: launch
+      args:
+      - name: spec
+        type: unknown
+      - name: sender
+        type: unknown
+      - name: onData
+        type: unknown
+      - name: onExit
         type: unknown
     - name: write
       args:
@@ -222,6 +236,289 @@ systems:
         type: unknown
     - name: killAll
       args: []
+  - id: sshfix
+    name: sshfix
+    kind: module
+    class_name: src/main/sshfix.js
+    methods:
+    - name: shq
+      args:
+      - name: word
+        type: unknown
+    - name: shqPath
+      args:
+      - name: p
+        type: unknown
+    - name: remoteResolve
+      args:
+      - name: root
+        type: unknown
+      - name: rel
+        type: unknown
+    - name: connectArgs
+      args:
+      - name: opts
+        type: unknown
+    - name: silentConnectArgs
+      args:
+      - name: opts
+        type: unknown
+    - name: runArgs
+      args:
+      - name: opts
+        type: unknown
+    - name: termArgs
+      args:
+      - name: opts
+        type: unknown
+    - name: checkArgs
+      args:
+      - name: opts
+        type: unknown
+    - name: exitArgs
+      args:
+      - name: opts
+        type: unknown
+    - name: scpArgs
+      args:
+      - name: opts
+        type: unknown
+    - name: probeScript
+      args:
+      - name: root
+        type: unknown
+      - name: mkdir
+        type: unknown
+    - name: termCommand
+      args:
+      - name: root
+        type: unknown
+      - name: profile
+        type: unknown
+    - name: treeCommand
+      args:
+      - name: root
+        type: unknown
+      - name: depth
+        type: unknown
+      - name: ignore
+        type: unknown
+    - name: fingerprintCommand
+      args:
+      - name: root
+        type: unknown
+      - name: depth
+        type: unknown
+      - name: ignore
+        type: unknown
+    - name: statCommand
+      args:
+      - name: abs
+        type: unknown
+    - name: catCommand
+      args:
+      - name: abs
+        type: unknown
+    - name: writeCommand
+      args:
+      - name: abs
+        type: unknown
+    - name: createFileCommand
+      args:
+      - name: abs
+        type: unknown
+    - name: mkdirCommand
+      args:
+      - name: abs
+        type: unknown
+    - name: renameCommand
+      args:
+      - name: from
+        type: unknown
+      - name: to
+        type: unknown
+    - name: trashCommand
+      args:
+      - name: abs
+        type: unknown
+      - name: trashDir
+        type: unknown
+      - name: stamp
+        type: unknown
+    - name: mkdirpCommand
+      args:
+      - name: abs
+        type: unknown
+    - name: freeName
+      args:
+      - name: base
+        type: unknown
+      - name: taken
+        type: unknown
+    - name: parseProbe
+      args:
+      - name: out
+        type: unknown
+    - name: parseStat
+      args:
+      - name: out
+        type: unknown
+    - name: buildTree
+      args:
+      - name: out
+        type: unknown
+      - name: decorate
+        type: unknown
+    - name: authUrl
+      args:
+      - name: out
+        type: unknown
+    - name: hostKeyPrompt
+      args:
+      - name: out
+        type: unknown
+    - name: hostKeyChanged
+      args:
+      - name: out
+        type: unknown
+    - name: socketDead
+      args:
+      - name: out
+        type: unknown
+    - name: denied
+      args:
+      - name: out
+        type: unknown
+    - name: unreachable
+      args:
+      - name: out
+        type: unknown
+    - name: noSuchUser
+      args:
+      - name: out
+        type: unknown
+    - name: loggedOut
+      args:
+      - name: out
+        type: unknown
+    - name: classify
+      args:
+      - name: out
+        type: unknown
+    - name: describe
+      args:
+      - name: cls
+        type: unknown
+    - name: explain
+      args:
+      - name: state
+        type: unknown
+  - id: remote
+    name: remote
+    kind: module
+    class_name: src/main/remote.js
+    depends_on:
+    - main.sshfix
+    signals:
+    - name: remote:state
+      args: []
+    methods:
+    - name: info
+      args: []
+    - name: setState
+      args:
+      - name: state
+        type: unknown
+      - name: extra
+        type: unknown
+    - name: connect
+      args:
+      - name: opts
+        type: unknown
+    - name: silentConnect
+      args: []
+    - name: healthy
+      args: []
+    - name: heartbeat
+      args: []
+    - name: run
+      args:
+      - name: command
+        type: unknown
+      - name: opts
+        type: unknown
+    - name: text
+      args:
+      - name: command
+        type: unknown
+      - name: opts
+        type: unknown
+    - name: disconnect
+      args: []
+    - name: resolveSafe
+      args:
+      - name: rel
+        type: unknown
+    - name: inboxDir
+      args:
+      - name: providerId
+        type: unknown
+    - name: tree
+      args:
+      - name: depth
+        type: unknown
+    - name: fingerprint
+      args:
+      - name: depth
+        type: unknown
+    - name: stat
+      args:
+      - name: rel
+        type: unknown
+    - name: readText
+      args:
+      - name: rel
+        type: unknown
+    - name: writeText
+      args:
+      - name: rel
+        type: unknown
+      - name: content
+        type: unknown
+    - name: readDoc
+      args:
+      - name: rel
+        type: unknown
+    - name: createFile
+      args:
+      - name: rel
+        type: unknown
+    - name: createFolder
+      args:
+      - name: rel
+        type: unknown
+    - name: rename
+      args:
+      - name: fromRel
+        type: unknown
+      - name: toRel
+        type: unknown
+    - name: trash
+      args:
+      - name: rel
+        type: unknown
+    - name: ingest
+      args:
+      - name: absSource
+        type: unknown
+      - name: providerId
+        type: unknown
+    - name: cache
+      args:
+      - name: rel
+        type: unknown
+      - name: st
+        type: unknown
   - id: scratch
     name: scratch
     kind: module
@@ -261,7 +558,67 @@ systems:
     name: workspace
     kind: module
     class_name: src/main/workspace.js
+    depends_on:
+    - main.remote
+    - main.scratch
+    - main.sshfix
     methods:
+    - name: configureRemote
+      args:
+      - name: hooks
+        type: unknown
+    - name: isRemote
+      args:
+      - name: space
+        type: unknown
+    - name: conn
+      args:
+      - name: space
+        type: unknown
+    - name: backendFor
+      args:
+      - name: space
+        type: unknown
+    - name: backend
+      args: []
+    - name: remoteState
+      args:
+      - name: id
+        type: unknown
+    - name: addRemote
+      args:
+      - name: name
+        type: unknown
+      - name: host
+        type: unknown
+      - name: remotePath
+        type: unknown
+    - name: ensureInbox
+      args: []
+    - name: ingestInto
+      args:
+      - name: spaceId
+        type: unknown
+      - name: absSource
+        type: unknown
+      - name: providerId
+        type: unknown
+    - name: localFileFor
+      args:
+      - name: rel
+        type: unknown
+    - name: localCwd
+      args: []
+    - name: stagingDir
+      args:
+      - name: providerId
+        type: unknown
+    - name: disconnectAll
+      args: []
+    - name: watchRemote
+      args:
+      - name: callback
+        type: unknown
     - name: list
       args: []
     - name: activeId
@@ -369,6 +726,14 @@ systems:
       - name: absSource
         type: unknown
       - name: providerId
+        type: unknown
+    - name: watchPlan
+      args:
+      - name: root
+        type: unknown
+      - name: maxDepth
+        type: unknown
+      - name: budget
         type: unknown
     - name: watch
       args:

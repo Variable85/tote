@@ -16,6 +16,14 @@ contextBridge.exposeInMainWorld('tote', {
   wsPromote: (id) => ipcRenderer.invoke('workspaces:promote', id),
   setWorkspacePath: (id) => ipcRenderer.invoke('workspaces:setPath', id),
 
+  // remote spaces (ssh, e.g. over Tailscale)
+  addRemoteWorkspace: (name, host, path) =>
+    ipcRenderer.invoke('workspaces:addRemote', { name, host, path }),
+  remoteConnect: (id, cols, rows, mkdir) =>
+    ipcRenderer.invoke('remote:connect', { id, cols, rows, mkdir }),
+  remoteState: (id) => ipcRenderer.invoke('remote:state', id),
+  remoteDisconnect: (id) => ipcRenderer.invoke('remote:disconnect', id),
+
   // files (active workspace)
   getRoot: () => ipcRenderer.invoke('workspace:getRoot'),
   tree: () => ipcRenderer.invoke('workspace:tree'),
@@ -74,6 +82,7 @@ contextBridge.exposeInMainWorld('tote', {
   onPtyData: (cb) => ipcRenderer.on('pty:data', (e, m) => cb(m.id, m.data)),
   onPtyExit: (cb) => ipcRenderer.on('pty:exit', (e, m) => cb(m.id, m.exitCode)),
   onWorkspaceChanged: (cb) => ipcRenderer.on('workspace:changed', () => cb()),
+  onRemoteState: (cb) => ipcRenderer.on('remote:state', (e, info) => cb(info)),
   onWorkspacesSwept: (cb) => ipcRenderer.on('workspace:swept', (e, list) => cb(list)),
   onDownloadDone: (cb) => ipcRenderer.on('download:done', (e, m) => cb(m)),
 });
