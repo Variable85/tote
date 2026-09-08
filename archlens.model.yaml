@@ -131,6 +131,8 @@ systems:
         type: unknown
     - name: migrateFromOmniHub
       args: []
+    - name: dropInheritedAgentSession
+      args: []
     - name: adoptLoginShellPath
       args: []
     - name: uniquePath
