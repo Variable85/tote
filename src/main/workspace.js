@@ -20,6 +20,37 @@ const IGNORE = new Set([
   '.terraform', 'Pods',
 ]);
 
+// Unity's generated dirs: the `.godot` story again at ten times the size --
+// `Library/` alone holds ~50k files, and a space with two Unity projects in it
+// bound 3.9k watch descriptors and walked 17.9k tree nodes on every tick.
+//
+// These names are far too ordinary to put in IGNORE, which matches a basename
+// anywhere: a hand-written `Library`, `Logs` or `obj` of source would silently
+// vanish from the files pane. So they only count as generated when the
+// directory holding them is a Unity project -- `Assets` + `ProjectSettings`
+// siblings, which is the same pair Unity itself looks for.
+const IGNORE_UNITY = new Set([
+  'Library', 'Temp', 'Obj', 'obj', 'Logs', 'MemoryCaptures',
+]);
+
+// The one predicate every local walk and the watcher share: `(dir, name) =>
+// skip?`. The Unity marker test hits the disk, so it is memoized per directory
+// -- one pair of existsSync calls per project, not per entry. The memo lives as
+// long as the walk (or the watcher), so a project created later is picked up on
+// the next arm.
+function skipper() {
+  const unity = new Map();
+  const isUnityProject = (dir) => {
+    let v = unity.get(dir);
+    if (v === undefined) {
+      v = fs.existsSync(path.join(dir, 'Assets')) && fs.existsSync(path.join(dir, 'ProjectSettings'));
+      unity.set(dir, v);
+    }
+    return v;
+  };
+  return (dir, name) => IGNORE.has(name) || (IGNORE_UNITY.has(name) && isUnityProject(dir));
+}
+
 // Ceiling on how many paths the tree watcher may bind.
 //
 // chokidar 4 dropped its fsevents dependency, so on every platform it falls
@@ -33,7 +64,14 @@ const IGNORE = new Set([
 //
 // IGNORE alone cannot be trusted to hold the line (the next project type brings
 // a cache dir nobody listed), so the depth is chosen to fit this budget.
-const WATCH_BUDGET = 4000;
+//
+// The number is deliberately far below the ceiling rather than near it. What it
+// rations is the main process's descriptors, and everything else in the app --
+// every webview partition's leveldb, every pty, the download bridge -- is
+// spending out of the same pool. 4000 was measured hovering at ~4.4k open fds
+// with terminals already failing, so keep the watcher's share small enough that
+// a space switch is never the thing that runs the process out.
+const WATCH_BUDGET = 1500;
 const PARTIAL_EXT = new Set(['.crdownload', '.part', '.download', '.partial', '.tmp']);
 const TEXT_EXT = new Set([
   '.txt', '.md', '.markdown', '.json', '.js', '.mjs', '.cjs', '.ts', '.tsx', '.jsx',
@@ -135,6 +173,7 @@ class WorkspaceManager {
   constructor(configStore) {
     this.cfg = configStore;
     this.watcher = null;
+    this.watchGen = 0;               // only the newest watch() arm may bind
     this.dlWatcher = null;
     this.poller = null;
     this.conns = new Map();          // spaceId -> RemoteConn, created lazily
@@ -502,6 +541,7 @@ class WorkspaceManager {
   async tree(depth = 5) {
     const R = this.backend();
     if (R) return R.tree(depth);
+    const skip = skipper();
     const walk = (abs, rel, d) => {
       let entries;
       try {
@@ -511,7 +551,7 @@ class WorkspaceManager {
       }
       const out = [];
       for (const e of entries) {
-        if (IGNORE.has(e.name)) continue;
+        if (skip(abs, e.name)) continue;
         const childAbs = path.join(abs, e.name);
         const childRel = rel === '.' ? e.name : rel + '/' + e.name;
         if (e.isDirectory()) {
@@ -683,6 +723,7 @@ class WorkspaceManager {
   // us"; only the second is worth warning about, and most projects are the
   // first.
   watchPlan(root, maxDepth = 5, budget = WATCH_BUDGET) {
+    const skip = skipper();
     let level = [root];
     let total = 1;
     let fits = 0;
@@ -696,7 +737,7 @@ class WorkspaceManager {
           continue;
         }
         for (const e of entries) {
-          if (IGNORE.has(e.name)) continue;
+          if (skip(dir, e.name)) continue;
           total++;
           if (e.isDirectory()) next.push(path.join(dir, e.name));
         }
@@ -709,26 +750,44 @@ class WorkspaceManager {
     return { depth: fits, capped: false };
   }
 
-  watch(callback) {
+  // Re-armed on every active-space change, which is why the old watcher's close
+  // has to finish before the new one binds. Fire-and-forget held both sets of
+  // descriptors open across a switch -- and a switch is precisely when the
+  // process ran out of them. The generation guard is for a user clicking
+  // through spaces faster than a close resolves: only the newest arm may
+  // install a watcher.
+  async watch(callback) {
     const chokidar = require('chokidar');
-    if (this.watcher) this.watcher.close();
+    const gen = ++this.watchGen;
+    const old = this.watcher;
     this.watcher = null;
     clearInterval(this.poller);
     this.poller = null;
+    if (old) {
+      try {
+        await old.close();
+      } catch {}
+      if (gen !== this.watchGen) return;   // a newer switch owns the watcher now
+    }
     if (this.isRemote(this.active())) return this.watchRemote(callback);
     let timer = null;
-    const { depth, capped } = this.watchPlan(this.getRoot());
+    const root = this.getRoot();
+    const { depth, capped } = this.watchPlan(root);
     if (capped) {
       console.warn(
-        `[tote] ${this.getRoot()}: over ${WATCH_BUDGET} watchable paths, ` +
+        `[tote] ${root}: over ${WATCH_BUDGET} watchable paths, ` +
           `watching to depth ${depth} only; deeper changes will not auto-refresh. ` +
-          `Add the generated cache dir to IGNORE in workspace.js to watch fully.`,
+          `Add the generated cache dir to IGNORE (or IGNORE_UNITY) in workspace.js to watch fully.`,
       );
     }
-    this.watcher = chokidar.watch(this.getRoot(), {
+    const skip = skipper();
+    this.watcher = chokidar.watch(root, {
       ignoreInitial: true,
       depth,
-      ignored: (p) => IGNORE.has(path.basename(p)),
+      // The root is handed to this predicate too, and pruning it would watch
+      // nothing at all -- a space whose own folder happens to be called `out`,
+      // `dist` or `Logs`.
+      ignored: (p) => p !== root && skip(path.dirname(p), path.basename(p)),
     });
     this.watcher.on('all', () => {
       clearTimeout(timer);

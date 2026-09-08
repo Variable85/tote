@@ -88,6 +88,15 @@ class PtyManager {
     });
     proc.onExit(({ exitCode }) => {
       this.sessions.delete(id);
+      // node-pty reports exit when the master hits EOF, which is not always the
+      // same moment the child dies: a shell that never got the pty as its
+      // controlling terminal (seen for real with the main process near its
+      // descriptor limit) keeps running after its pane has already printed
+      // "process exited", orphaned with nothing left to read it. Reap it here --
+      // for a child that really is gone this throws ESRCH and costs nothing.
+      try {
+        proc.kill();
+      } catch {}
       try {
         if (sender) sender.send('pty:exit', { id, exitCode });
       } catch {}

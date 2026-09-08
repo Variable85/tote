@@ -757,6 +757,8 @@ systems:
       args:
       - name: name
         type: unknown
+    - name: skipper
+      args: []
 - id: preload
   name: Preload
   components:
