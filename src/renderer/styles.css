@@ -57,8 +57,28 @@ code {
   background: #090c14;
   border-bottom: 1px solid #1e2534;
 }
-#ws-tabs { display: flex; gap: 3px; flex: 1; overflow-x: auto; scrollbar-width: none; }
+/* The strip scrolls rather than squeezing the tabs: a space's name is how you
+   recognise it, so tabs keep their width and the overflow is reachable by
+   wheel (mapped to the horizontal axis in app.js), trackpad swipe or drag.
+   The scrollbar stays hidden -- it would push the tabs off the bar's bottom
+   border -- so the fade masks below are the only "there is more" affordance. */
+#ws-tabs {
+  display: flex;
+  gap: 3px;
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scrollbar-width: none;
+  overscroll-behavior-x: contain;
+}
 #ws-tabs::-webkit-scrollbar { display: none; }
+#ws-tabs.ovf-l { mask-image: linear-gradient(to right, transparent 0, #000 24px); }
+#ws-tabs.ovf-r { mask-image: linear-gradient(to left, transparent 0, #000 24px); }
+#ws-tabs.ovf-l.ovf-r {
+  mask-image: linear-gradient(to right, transparent 0, #000 24px,
+                              #000 calc(100% - 24px), transparent 100%);
+}
 .ws-tab {
   display: flex;
   align-items: center;

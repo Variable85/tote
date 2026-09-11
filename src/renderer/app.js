@@ -68,6 +68,7 @@ function activeWorkspace() {
 function renderWorkspaceSwitcher() {
   const bar = $('#ws-tabs');
   bar.innerHTML = '';
+  let active = null;
   for (const w of state.workspaces.list) {
     const tab = document.createElement('div');
     tab.className = 'ws-tab' + (w.id === state.workspaces.active ? ' active' : '')
@@ -136,6 +137,7 @@ function renderWorkspaceSwitcher() {
       if (!state.wsDrag || state.wsDrag === w.id) return;
       e.preventDefault();
       e.dataTransfer.dropEffect = 'move';
+      wsDragScroll(bar, e.clientX); // a tab past the visible edge must be reachable
       const r = tab.getBoundingClientRect();
       const after = e.clientX > r.left + r.width / 2;
       clearWsDropMark();
@@ -150,6 +152,7 @@ function renderWorkspaceSwitcher() {
       clearWsDropMark();
       if (src !== w.id) moveWorkspace(src, w.id, after);
     };
+    if (w.id === state.workspaces.active) active = tab;
     bar.appendChild(tab);
   }
   // Empty strip space past the last tab: drop there means "move to the end".
@@ -164,11 +167,52 @@ function renderWorkspaceSwitcher() {
     e.preventDefault();
     moveWorkspace(state.wsDrag, null, true);
   };
+  if (active) revealWsTab(bar, active); // switching to an off-screen space must show it
+  updateWsOverflow();
   const ws = activeWorkspace();
   const label = ws ? (isRemote(ws) ? ws.host + ':' + ws.path : ws.path) : '';
   $('#workspace-root').textContent = label;
   $('#workspace-root').title = label;
 }
+
+/* The strip overflows once a user collects spaces, and a hidden scrollbar plus
+   a wheel that only scrolls vertically means "the rest of my spaces are
+   unreachable". These four keep the whole list in reach without changing the
+   tabs themselves: the fade marks which edge has more, the wheel maps either
+   axis onto scrollLeft, a render reveals the active tab, and a drag scrolls
+   when it nears an edge. Measured in clientX/rect space, never offsetLeft --
+   the tabs' offsetParent is not the strip. */
+function updateWsOverflow() {
+  const bar = $('#ws-tabs');
+  const max = bar.scrollWidth - bar.clientWidth;
+  bar.classList.toggle('ovf-l', max > 1 && bar.scrollLeft > 1);
+  bar.classList.toggle('ovf-r', max > 1 && bar.scrollLeft < max - 1);
+}
+
+function revealWsTab(bar, el) {
+  const r = el.getBoundingClientRect();
+  const b = bar.getBoundingClientRect();
+  if (r.left < b.left) bar.scrollLeft -= b.left - r.left + 8;
+  else if (r.right > b.right) bar.scrollLeft += r.right - b.right + 8;
+}
+
+function wsDragScroll(bar, clientX) {
+  const b = bar.getBoundingClientRect();
+  if (clientX < b.left + 36) bar.scrollLeft -= 14;
+  else if (clientX > b.right - 36) bar.scrollLeft += 14;
+}
+
+$('#ws-tabs').addEventListener('scroll', updateWsOverflow);
+// A vertical wheel is what a mouse has, so it drives the horizontal strip.
+$('#ws-tabs').addEventListener('wheel', (e) => {
+  const bar = $('#ws-tabs');
+  if (bar.scrollWidth <= bar.clientWidth) return;
+  const d = Math.abs(e.deltaX) > Math.abs(e.deltaY) ? e.deltaX : e.deltaY;
+  if (!d) return;
+  e.preventDefault();
+  bar.scrollLeft += d;
+}, { passive: false });
+new ResizeObserver(updateWsOverflow).observe($('#ws-tabs'));
 
 function clearWsDropMark() {
   for (const el of document.querySelectorAll('.ws-tab.drop-before, .ws-tab.drop-after')) {
